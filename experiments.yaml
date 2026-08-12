@@ -1,0 +1,36 @@
+defaults:
+  model_name: "harindhar10/OLMo-7B-fsdp-Pubchem-5M-1epochs"
+  base_model: "allenai/OLMo-7B"
+  precision: "bf16-mixed"
+  seeds: [42, 43, 44]
+  early_stopping_patience: 3
+  strategy: null       # null for single GPU, "ddp" for multi-GPU
+
+datasets:
+  bbbp:
+    task_type: classification
+    loader: "load_bbbp"
+    metric: "val_roc_auc"
+    metric_mode: "max"
+    max_epochs: 10
+    batch_size: 4
+    eval_batch_size: 32
+    lr: 1.0e-4
+    lora_r: 16
+    lora_alpha: 32
+    lora_dropout: 0.1
+    weight_decay: 1.0e-3
+
+  bace_classification:
+    task_type: classification
+    loader: "load_bace_classification"
+    metric: "val_roc_auc"
+    metric_mode: "max"
+    max_epochs: 10
+    batch_size: 4
+    eval_batch_size: 32
+    lr: 1.0e-4
+    lora_r: 16
+    lora_alpha: 32
+    lora_dropout: 0.1
+    weight_decay: 1.0e-3
