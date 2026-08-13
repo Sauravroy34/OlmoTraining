@@ -228,6 +228,12 @@ def train_single_seed(
     )
 
     # Save the LoRA adapters
+
+    best_model.configure_model()
+
+    ckpt = torch.load(checkpoint_callback.best_model_path)
+    best_model.load_state_dict(ckpt["state_dict"], strict=False)
+    
     best_model.model.save_pretrained(str(adapter_dir))
     print(f"  LoRA adapters saved to: {adapter_dir}")
 
@@ -242,16 +248,16 @@ def train_single_seed(
     # Create a fresh model that will load the saved adapters
     # We pass the adapter_dir as model_name so _load_model detects the adapter_config.json
     eval_hparams = hparams_config.copy()
+
     eval_model = Model.OlmoModelQLora(
         hparams_config=eval_hparams,
         num_tasks=num_tasks,
         task_type=task_type,
-        model_name=str(adapter_dir),  # point to the saved adapters
+        model_name=model_name,  # point to the saved adapters
         base_model=base_model,
     )
-    # configure_model is called lazily by Lightning, but we need to ensure
-    # the classifier head is loaded after model setup
-    eval_model.configure_model()
+
+    eval_model.configure_model(checkpoint_path=str(adapter_dir))
 
     # Load the saved classifier head
     eval_model.classifier.load_state_dict(torch.load(str(classifier_path), weights_only=True))

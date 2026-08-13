@@ -67,7 +67,7 @@ class OlmoModelQLora(pl.LightningModule):
         )
         return loss
 
-    def _load_model(self):
+    def _load_model(self,checkpoint_path):
 
         from huggingface_hub import model_info
         info = model_info(self.model_name)
@@ -82,7 +82,13 @@ class OlmoModelQLora(pl.LightningModule):
                 dtype=torch.bfloat16
             )
             model = PeftModel.from_pretrained(base_model, self.model_name)
-            model = model.merge_and_unload()
+            model = model.merge_and_unload() 
+
+            #this part is for testing the
+            if checkpoint_path is not None:
+                peft_model = PeftModel.from_pretrained(model, checkpoint_path)
+                return peft_model
+
             model = prepare_model_for_kbit_training(model)
             model = get_peft_model(model, self.peft_config)
             return model
@@ -93,12 +99,20 @@ class OlmoModelQLora(pl.LightningModule):
             trust_remote_code=True,
             dtype=torch.bfloat16
         )
+
+        #this part is for testing the
+        if checkpoint_path is not None:
+            peft_model = PeftModel.from_pretrained(model, checkpoint_path)
+            return peft_model
+
         model = prepare_model_for_kbit_training(model)
         model = get_peft_model(model, self.peft_config)
         return model
         
-    def configure_model(self):
-        self.model = self._load_model()
+    def configure_model(self,checkpoint_path = None):
+        
+        self.model = self._load_model(checkpoint_path)
+
         self.model.config.pad_token_id = self.tokenizer.pad_token_id
         self.model.gradient_checkpointing_enable()
             
