@@ -110,7 +110,9 @@ class OlmoModelQLora(pl.LightningModule):
         return model
         
     def configure_model(self,checkpoint_path = None):
-        
+        #dont call configure model if model is already intalised
+        if getattr(self, "model", None) is not None:
+            return
         self.model = self._load_model(checkpoint_path)
 
         self.model.config.pad_token_id = self.tokenizer.pad_token_id

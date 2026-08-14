@@ -1,31 +1,21 @@
+%%writefile /kaggle/working/OlmoTraining/run_experiments.py
 """
 Fine-tune OLMo (QLoRA) on MoleculeNet datasets with multi-seed evaluation.
-
-Each experiment is run 3 times with different seeds (configurable in experiments.yaml).
-Training uses early stopping (patience 3). After training, only LoRA adapters and the
-classifier head are saved. For evaluation, adapters are loaded onto a fresh base model
-and the test set is evaluated via trainer.test().
-
-Usage:
-    python run_experiments.py --datasets bbbp
-    python run_experiments.py --datasets bbbp bace_classification
-    python run_experiments.py --datasets all
-    python run_experiments.py --datasets bbbp --config my_config.yaml
-    python run_experiments.py --datasets all --dry-run
-    python run_experiments.py --datasets bbbp --strategy ddp --devices 4
 """
 
 import argparse
+import gc
 import importlib
 import json
-import yaml
-import torch
-import numpy as np
 import os
+import shutil
+import yaml
+import numpy as np
+import torch
 from pathlib import Path
 
 import pytorch_lightning as pl
-from pytorch_lightning.callbacks import EarlyStopping, ModelCheckpoint
+from pytorch_lightning.callbacks import EarlyStopping, Callback
 from torch.utils.data import DataLoader
 
 import Model
@@ -34,21 +24,62 @@ import dataset
 from rdkit import RDLogger
 RDLogger.DisableLog('rdApp.*')
 
+# ===========================================================================
+# CUSTOM CALLBACK: Save ONLY LoRA Adapters (Solves Disk & RAM OOM)
+# ===========================================================================
+class AdapterOnlyCheckpoint(Callback):
+    """
+    Monitors a validation metric and saves ONLY the LoRA adapters and classifier
+    head when the metric improves. Overwrites the previous best to prevent disk bloat.
+    """
+    def __init__(self, monitor: str, mode: str, adapter_dir: str, classifier_path: str):
+        super().__init__()
+        self.monitor = monitor
+        self.mode = mode
+        self.adapter_dir = adapter_dir
+        self.classifier_path = classifier_path
+        
+        # Set initial best score depending on if we are minimizing or maximizing
+        self.best_score = float("inf") if mode == "min" else float("-inf")
+
+    def on_validation_epoch_end(self, trainer, pl_module):
+        # Get the current metric
+        metrics = trainer.callback_metrics
+        if self.monitor not in metrics:
+            return
+        
+        current_score = metrics[self.monitor].item()
+        
+        # Check if the score improved
+        improved = False
+        if self.mode == "min" and current_score < self.best_score:
+            improved = True
+        elif self.mode == "max" and current_score > self.best_score:
+            improved = True
+
+        if improved:
+            self.best_score = current_score
+            # Only save on the main process to avoid DDP race conditions
+            if trainer.is_global_zero:
+                print(f"\n  [Checkpoint] {self.monitor} improved to {self.best_score:.4f}. Saving adapters...")
+                
+                # Creates/Overwrites the adapter files (no cumulative bloat!)
+                pl_module.model.save_pretrained(self.adapter_dir)
+                
+                # Overwrites the classifier head
+                torch.save(pl_module.classifier.state_dict(), self.classifier_path)
 
 # ---------------------------------------------------------------------------
 # Config loading
 # ---------------------------------------------------------------------------
 def load_config(config_path: str) -> dict:
-    """Load YAML config and return the parsed dict."""
     path = Path(config_path)
     if not path.exists():
         raise FileNotFoundError(f"Config file not found: {config_path}")
     with open(path, "r") as f:
         return yaml.safe_load(f)
 
-
 def get_dataset_config(config: dict, dataset_name: str) -> dict:
-    """Merge per-dataset config with defaults and return a complete config."""
     defaults = config.get("defaults", {})
     datasets_cfg = config.get("datasets", {})
 
@@ -59,20 +90,12 @@ def get_dataset_config(config: dict, dataset_name: str) -> dict:
         )
 
     ds_cfg = datasets_cfg[dataset_name]
-    # Merge: per-dataset values override defaults
-    merged = {**defaults, **ds_cfg}
-    return merged
-
+    return {**defaults, **ds_cfg}
 
 # ---------------------------------------------------------------------------
 # DeepChem loader resolver
 # ---------------------------------------------------------------------------
 def resolve_loader(loader_name: str):
-    """
-    Dynamically import a DeepChem MoleculeNet loader by name.
-
-    Example: resolve_loader("load_bbbp") → deepchem.molnet.load_bbbp
-    """
     try:
         molnet = importlib.import_module("deepchem.molnet")
         loader_fn = getattr(molnet, loader_name)
@@ -81,7 +104,6 @@ def resolve_loader(loader_name: str):
         raise ImportError(
             f"Could not resolve loader '{loader_name}' from deepchem.molnet: {e}"
         )
-
 
 # ---------------------------------------------------------------------------
 # Single seed training + evaluation
@@ -92,18 +114,11 @@ def train_single_seed(
     seed: int,
     output_root: Path,
 ) -> dict:
-    """
-    Train the model for one seed, save adapters, reload them, and evaluate on test.
-
-    Returns a dict with the test metric name and value.
-    """
     # --- Seed everything ---
     pl.seed_everything(seed, workers=True)
 
-    # --- Resolve the DeepChem loader ---
     loader_fn = resolve_loader(ds_config["loader"])
 
-    # --- Extract hyperparameters ---
     model_name = ds_config["model_name"]
     base_model = ds_config["base_model"]
     task_type = ds_config["task_type"]
@@ -115,8 +130,10 @@ def train_single_seed(
     batch_size = ds_config["batch_size"]
     eval_batch_size = ds_config.get("eval_batch_size", batch_size)
     strategy = ds_config.get("strategy", None)
+
+    # Limit workers for Kaggle memory stability
+    num_workers = min(2, os.cpu_count() or 2)
     
-    num_workers = os.cpu_count() or 4
     if strategy is None:
         pl_strategy = "auto"
         devices = 1
@@ -135,19 +152,18 @@ def train_single_seed(
         "weight_decay": ds_config["weight_decay"],
     }
 
-    # --- Output directory for this seed ---
+    # --- Paths ---
     seed_dir = output_root / dataset_name / f"seed_{seed}"
     seed_dir.mkdir(parents=True, exist_ok=True)
-    adapter_dir = seed_dir / "adapters"
+    adapter_dir = str(seed_dir / "adapters")
+    classifier_path = str(seed_dir / "classifier.pt")
 
-    # --- Create datasets ---
     print(f"\n{'='*60}")
     print(f"  Dataset: {dataset_name} | Seed: {seed}")
     print(f"{'='*60}")
-    print(f"  Hyperparameters: {json.dumps(hparams_config, indent=2)}")
 
     train_ds = dataset.MolnetDataset(
-        loader_fn, mode="train", model=model_name, do_random=True, prob=0.2
+        loader_fn, mode="train", model=model_name, do_random = False
     )
     val_ds = dataset.MolnetDataset(
         loader_fn, mode="valid", model=model_name, do_random=False
@@ -157,10 +173,7 @@ def train_single_seed(
     )
 
     num_tasks = train_ds.num_tasks
-    print(f"  Num tasks: {num_tasks}")
-    print(f"  Train: {len(train_ds)} | Val: {len(val_ds)} | Test: {len(test_ds)}")
 
-    # --- DataLoaders ---
     train_loader = DataLoader(
         train_ds, batch_size=batch_size, shuffle=True,
         num_workers=num_workers, pin_memory=True,
@@ -190,13 +203,13 @@ def train_single_seed(
         mode=metric_mode,
         verbose=True,
     )
-    checkpoint_callback = ModelCheckpoint(
-        dirpath=str(seed_dir / "checkpoints"),
-        filename=f"{dataset_name}_seed{seed}_best",
+    
+    # Use our custom callback instead of PyTorch Lightning's ModelCheckpoint
+    adapter_checkpoint = AdapterOnlyCheckpoint(
         monitor=metric,
         mode=metric_mode,
-        save_top_k=1,
-        verbose=True,
+        adapter_dir=adapter_dir,
+        classifier_path=classifier_path
     )
 
     # --- Trainer ---
@@ -206,100 +219,87 @@ def train_single_seed(
         accelerator="gpu",
         strategy=pl_strategy,
         devices=devices,
-        callbacks=[early_stopping, checkpoint_callback],
+        callbacks=[early_stopping, adapter_checkpoint],
+        enable_checkpointing=False, # CRITICAL: Disables PL's 8GB .ckpt files
         enable_progress_bar=True,
         log_every_n_steps=10,
-        deterministic=False,  # some ops don't support deterministic on GPU
+        deterministic=False,
     )
 
     # --- Train ---
     print(f"\n  Starting training...")
     trainer.fit(model, train_dataloaders=train_loader, val_dataloaders=val_loader)
-    print(f"  Training complete. Best checkpoint: {checkpoint_callback.best_model_path}")
+    print(f"  Training complete.")
 
-    # --- Save LoRA adapters and classifier head from best checkpoint ---
-    best_model = Model.OlmoModelQLora.load_from_checkpoint(
-        checkpoint_callback.best_model_path,
-        hparams_config=hparams_config,
-        num_tasks=num_tasks,
-        task_type=task_type,
-        model_name=model_name,
-        base_model=base_model,
-    )
+    if trainer.is_global_zero:
+        # We NO LONGER need to extract from a .ckpt file!
+        # The custom callback has already saved the best adapters to disk.
 
-    # Save the LoRA adapters
+        # --- Clean up training variables to free RAM ---
+        del model
+        del trainer
+        gc.collect()
+        torch.cuda.empty_cache()
 
-    best_model.configure_model()
+        # --- Evaluation: load BEST adapters onto a fresh model and test ---
+        print(f"\n  Loading BEST adapters for test evaluation...")
 
-    ckpt = torch.load(checkpoint_callback.best_model_path)
-    best_model.load_state_dict(ckpt["state_dict"], strict=False)
-    
-    best_model.model.save_pretrained(str(adapter_dir))
-    print(f"  LoRA adapters saved to: {adapter_dir}")
+        eval_model = Model.OlmoModelQLora(
+            hparams_config=hparams_config.copy(),
+            num_tasks=num_tasks,
+            task_type=task_type,
+            model_name=model_name,
+            base_model=base_model,
+        )
 
-    # Save the classifier head
-    classifier_path = seed_dir / "classifier.pt"
-    torch.save(best_model.classifier.state_dict(), str(classifier_path))
-    print(f"  Classifier head saved to: {classifier_path}")
+        eval_model.configure_model(checkpoint_path=adapter_dir)
+        eval_model.classifier.load_state_dict(torch.load(classifier_path, weights_only=True))
+        print(f"  Adapters and classifier loaded successfully.")
 
-    # --- Evaluation: load adapters onto a fresh model and test ---
-    print(f"\n  Loading adapters for test evaluation...")
+        # Cleanup classifier file from disk now that it's in memory (optional)
+        if os.path.exists(classifier_path):
+            os.remove(classifier_path)
 
-    # Create a fresh model that will load the saved adapters
-    # We pass the adapter_dir as model_name so _load_model detects the adapter_config.json
-    eval_hparams = hparams_config.copy()
+        # --- Run test ---
+        eval_trainer = pl.Trainer(
+            precision=precision,
+            accelerator="gpu",
+            strategy="auto",
+            devices=1,
+            enable_progress_bar=True,
+        )
 
-    eval_model = Model.OlmoModelQLora(
-        hparams_config=eval_hparams,
-        num_tasks=num_tasks,
-        task_type=task_type,
-        model_name=model_name,  # point to the saved adapters
-        base_model=base_model,
-    )
+        test_results = eval_trainer.test(eval_model, dataloaders=test_loader)
 
-    eval_model.configure_model(checkpoint_path=str(adapter_dir))
+        test_metric_name = metric.replace("val_", "test_")
+        test_metric_value = test_results[0].get(test_metric_name, None)
+        print(f"  Test metric ({test_metric_name}): {test_metric_value}")
 
-    # Load the saved classifier head
-    eval_model.classifier.load_state_dict(torch.load(str(classifier_path), weights_only=True))
-    print(f"  Adapters and classifier loaded successfully.")
+        # --- Final RAM & GPU memory cleanup ---
+        del eval_model
+        del eval_trainer
+        gc.collect()
+        torch.cuda.empty_cache()
 
-    # --- Run test ---
-    eval_trainer = pl.Trainer(
-        precision=precision,
-        accelerator="gpu",
-        strategy=pl_strategy,
-        devices=devices,
-        enable_progress_bar=True,
-    )
+        seed_result = {
+            "seed": seed,
+            "metric_name": test_metric_name,
+            "metric_value": test_metric_value,
+            "adapter_dir": adapter_dir,
+        }
 
-    test_results = eval_trainer.test(eval_model, dataloaders=test_loader)
+    else:
+        seed_result = None
 
-    # --- Extract test metric ---
-    test_metric_name = metric.replace("val_", "test_")
-    test_metric_value = test_results[0].get(test_metric_name, None)
-    print(f"  Test metric ({test_metric_name}): {test_metric_value}")
+    if torch.distributed.is_available() and torch.distributed.is_initialized():
+        torch.distributed.barrier()
 
-    # --- Cleanup GPU memory ---
-    del model, best_model, eval_model, trainer, eval_trainer
-    torch.cuda.empty_cache()
-
-    return {
-        "seed": seed,
-        "metric_name": test_metric_name,
-        "metric_value": test_metric_value,
-        "best_checkpoint": checkpoint_callback.best_model_path,
-        "adapter_dir": str(adapter_dir),
-    }
-
+    return seed_result
 
 # ---------------------------------------------------------------------------
 # Run all seeds for a dataset
 # ---------------------------------------------------------------------------
 def run_dataset(config: dict, dataset_name: str, output_root: Path) -> dict:
-    """
-    Run training + evaluation across all seeds for a single dataset.
-    Returns aggregated results.
-    """
     ds_config = get_dataset_config(config, dataset_name)
     seeds = ds_config.get("seeds", [42, 43, 44])
 
@@ -313,7 +313,6 @@ def run_dataset(config: dict, dataset_name: str, output_root: Path) -> dict:
         result = train_single_seed(ds_config, dataset_name, seed, output_root)
         all_results.append(result)
 
-    # --- Aggregate results ---
     metric_name = all_results[0]["metric_name"]
     metric_values = [r["metric_value"] for r in all_results if r["metric_value"] is not None]
 
@@ -336,85 +335,48 @@ def run_dataset(config: dict, dataset_name: str, output_root: Path) -> dict:
         "std": float(std_metric),
     }
 
-
 # ---------------------------------------------------------------------------
 # CLI entry point
 # ---------------------------------------------------------------------------
 def main():
-    parser = argparse.ArgumentParser(
-        description="Fine-tune OLMo (QLoRA) on MoleculeNet with multi-seed evaluation."
-    )
-    parser.add_argument(
-        "--datasets", nargs="+", required=True,
-        help="Dataset names from experiments.yaml, or 'all' to run everything.",
-    )
-    parser.add_argument(
-        "--config", type=str, default="experiments.yaml",
-        help="Path to the experiments YAML config file.",
-    )
-    parser.add_argument(
-        "--output-dir", type=str, default="results",
-        help="Root directory for saving adapters and results.",
-    )
-    parser.add_argument(
-        "--dry-run", action="store_true",
-        help="Print config and exit without training.",
-    )
-    parser.add_argument(
-        "--strategy", type=str, default=None,
-        help="Training strategy: 'ddp' for multi-GPU, or None for single GPU. Overrides YAML.",
-    )
+    parser = argparse.ArgumentParser(description="Fine-tune OLMo (QLoRA) on MoleculeNet.")
+    parser.add_argument("--datasets", nargs="+", required=True)
+    parser.add_argument("--config", type=str, default="experiments.yaml")
+    parser.add_argument("--output-dir", type=str, default="results")
+    parser.add_argument("--dry-run", action="store_true")
+    parser.add_argument("--strategy", type=str, default=None)
     args = parser.parse_args()
 
-    # --- Load config ---
     config = load_config(args.config)
     output_root = Path(args.output_dir)
 
-    # --- Resolve dataset list ---
     if args.datasets == ["all"]:
         dataset_names = list(config.get("datasets", {}).keys())
     else:
         dataset_names = args.datasets
 
-    print(f"\nDatasets to run: {dataset_names}")
-    print(f"Output directory: {output_root.resolve()}")
-
-    # --- Apply CLI overrides to config ---
     if args.strategy is not None:
         config.setdefault("defaults", {})["strategy"] = args.strategy
 
-    # --- Dry run: print config and exit ---
     if args.dry_run:
         print("\n--- DRY RUN ---")
-        for name in dataset_names:
-            ds_config = get_dataset_config(config, name)
-            print(f"\n  [{name}]")
-            for k, v in ds_config.items():
-                print(f"    {k}: {v}")
-        print("\nDry run complete. No training performed.")
         return
 
-    # --- Run experiments ---
     all_dataset_results = []
     for name in dataset_names:
         result = run_dataset(config, name, output_root)
         all_dataset_results.append(result)
 
-        # Save per-dataset results to JSON
         result_file = output_root / name / "results.json"
         result_file.parent.mkdir(parents=True, exist_ok=True)
         with open(result_file, "w") as f:
             json.dump(result, f, indent=2)
-        print(f"  Results saved to: {result_file}")
 
-    # --- Final summary ---
     print(f"\n{'#'*70}")
     print(f"  FINAL SUMMARY")
-    print(f"{'#'*70}")
     for r in all_dataset_results:
         print(f"  {r['dataset']:30s} {r['metric_name']}: {r['mean']:.4f} ± {r['std']:.4f}")
     print(f"{'#'*70}\n")
-
 
 if __name__ == "__main__":
     main()
