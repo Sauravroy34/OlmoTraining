@@ -1,6 +1,7 @@
-%%writefile /kaggle/working/OlmoTraining/run_experiments.py
 """
 Fine-tune OLMo (QLoRA) on MoleculeNet datasets with multi-seed evaluation.
+Designed for benchmarking: automatically purges adapter weights after test
+evaluation to keep disk usage at zero across multi-dataset runs.
 """
 
 import argparse
@@ -9,6 +10,7 @@ import importlib
 import json
 import os
 import shutil
+import tempfile
 import yaml
 import numpy as np
 import torch
@@ -24,33 +26,32 @@ import dataset
 from rdkit import RDLogger
 RDLogger.DisableLog('rdApp.*')
 
+
 # ===========================================================================
-# CUSTOM CALLBACK: Save ONLY LoRA Adapters (Solves Disk & RAM OOM)
+# CUSTOM CALLBACK: Save ONLY LoRA Adapters to Temp Path
 # ===========================================================================
 class AdapterOnlyCheckpoint(Callback):
     """
     Monitors a validation metric and saves ONLY the LoRA adapters and classifier
-    head when the metric improves. Overwrites the previous best to prevent disk bloat.
+    head to a temp folder when the metric improves.
     """
-    def __init__(self, monitor: str, mode: str, adapter_dir: str, classifier_path: str):
+    def __init__(self, monitor: str, mode: str, adapter_dir: Path, classifier_path: Path):
         super().__init__()
         self.monitor = monitor
         self.mode = mode
-        self.adapter_dir = adapter_dir
-        self.classifier_path = classifier_path
+        self.adapter_dir = str(adapter_dir.resolve())
+        self.classifier_path = str(classifier_path.resolve())
         
-        # Set initial best score depending on if we are minimizing or maximizing
         self.best_score = float("inf") if mode == "min" else float("-inf")
+        self.saved_any = False
 
     def on_validation_epoch_end(self, trainer, pl_module):
-        # Get the current metric
         metrics = trainer.callback_metrics
         if self.monitor not in metrics:
             return
         
         current_score = metrics[self.monitor].item()
         
-        # Check if the score improved
         improved = False
         if self.mode == "min" and current_score < self.best_score:
             improved = True
@@ -59,15 +60,13 @@ class AdapterOnlyCheckpoint(Callback):
 
         if improved:
             self.best_score = current_score
-            # Only save on the main process to avoid DDP race conditions
             if trainer.is_global_zero:
                 print(f"\n  [Checkpoint] {self.monitor} improved to {self.best_score:.4f}. Saving adapters...")
-                
-                # Creates/Overwrites the adapter files (no cumulative bloat!)
+                os.makedirs(self.adapter_dir, exist_ok=True)
                 pl_module.model.save_pretrained(self.adapter_dir)
-                
-                # Overwrites the classifier head
                 torch.save(pl_module.classifier.state_dict(), self.classifier_path)
+                self.saved_any = True
+
 
 # ---------------------------------------------------------------------------
 # Config loading
@@ -78,6 +77,7 @@ def load_config(config_path: str) -> dict:
         raise FileNotFoundError(f"Config file not found: {config_path}")
     with open(path, "r") as f:
         return yaml.safe_load(f)
+
 
 def get_dataset_config(config: dict, dataset_name: str) -> dict:
     defaults = config.get("defaults", {})
@@ -92,6 +92,7 @@ def get_dataset_config(config: dict, dataset_name: str) -> dict:
     ds_cfg = datasets_cfg[dataset_name]
     return {**defaults, **ds_cfg}
 
+
 # ---------------------------------------------------------------------------
 # DeepChem loader resolver
 # ---------------------------------------------------------------------------
@@ -104,6 +105,7 @@ def resolve_loader(loader_name: str):
         raise ImportError(
             f"Could not resolve loader '{loader_name}' from deepchem.molnet: {e}"
         )
+
 
 # ---------------------------------------------------------------------------
 # Single seed training + evaluation
@@ -131,7 +133,6 @@ def train_single_seed(
     eval_batch_size = ds_config.get("eval_batch_size", batch_size)
     strategy = ds_config.get("strategy", None)
 
-    # Limit workers for Kaggle memory stability
     num_workers = min(2, os.cpu_count() or 2)
     
     if strategy is None:
@@ -152,18 +153,17 @@ def train_single_seed(
         "weight_decay": ds_config["weight_decay"],
     }
 
-    # --- Paths ---
-    seed_dir = output_root / dataset_name / f"seed_{seed}"
-    seed_dir.mkdir(parents=True, exist_ok=True)
-    adapter_dir = str(seed_dir / "adapters")
-    classifier_path = str(seed_dir / "classifier.pt")
+    # Temporary directory for adapter storage during eval
+    temp_dir = Path(tempfile.mkdtemp(prefix=f"bm_{dataset_name}_s{seed}_")).resolve()
+    temp_adapter_dir = temp_dir / "adapters"
+    temp_classifier_path = temp_dir / "classifier.pt"
 
     print(f"\n{'='*60}")
     print(f"  Dataset: {dataset_name} | Seed: {seed}")
     print(f"{'='*60}")
 
     train_ds = dataset.MolnetDataset(
-        loader_fn, mode="train", model=model_name, do_random = False
+        loader_fn, mode="train", model=model_name
     )
     val_ds = dataset.MolnetDataset(
         loader_fn, mode="valid", model=model_name, do_random=False
@@ -204,12 +204,11 @@ def train_single_seed(
         verbose=True,
     )
     
-    # Use our custom callback instead of PyTorch Lightning's ModelCheckpoint
     adapter_checkpoint = AdapterOnlyCheckpoint(
         monitor=metric,
         mode=metric_mode,
-        adapter_dir=adapter_dir,
-        classifier_path=classifier_path
+        adapter_dir=temp_adapter_dir,
+        classifier_path=temp_classifier_path
     )
 
     # --- Trainer ---
@@ -220,7 +219,7 @@ def train_single_seed(
         strategy=pl_strategy,
         devices=devices,
         callbacks=[early_stopping, adapter_checkpoint],
-        enable_checkpointing=False, # CRITICAL: Disables PL's 8GB .ckpt files
+        enable_checkpointing=False,
         enable_progress_bar=True,
         log_every_n_steps=10,
         deterministic=False,
@@ -232,17 +231,22 @@ def train_single_seed(
     print(f"  Training complete.")
 
     if trainer.is_global_zero:
-        # We NO LONGER need to extract from a .ckpt file!
-        # The custom callback has already saved the best adapters to disk.
+        # Fallback: if no validation epoch improved score, save current state
+        adapter_config_file = temp_adapter_dir / "adapter_config.json"
+        if not adapter_config_file.exists():
+            print(f"  [Fallback] No improvement detected; saving final epoch weights for evaluation...")
+            temp_adapter_dir.mkdir(parents=True, exist_ok=True)
+            model.model.save_pretrained(str(temp_adapter_dir))
+            torch.save(model.classifier.state_dict(), str(temp_classifier_path))
 
-        # --- Clean up training variables to free RAM ---
+        # --- RAM Cleanup before test evaluation ---
         del model
         del trainer
         gc.collect()
         torch.cuda.empty_cache()
 
-        # --- Evaluation: load BEST adapters onto a fresh model and test ---
-        print(f"\n  Loading BEST adapters for test evaluation...")
+        # --- Evaluation: load adapters onto fresh model ---
+        print(f"\n  Loading adapters for test evaluation...")
 
         eval_model = Model.OlmoModelQLora(
             hparams_config=hparams_config.copy(),
@@ -252,13 +256,11 @@ def train_single_seed(
             base_model=base_model,
         )
 
-        eval_model.configure_model(checkpoint_path=adapter_dir)
-        eval_model.classifier.load_state_dict(torch.load(classifier_path, weights_only=True))
+        eval_model.configure_model(checkpoint_path=str(temp_adapter_dir))
+        eval_model.classifier.load_state_dict(
+            torch.load(str(temp_classifier_path), weights_only=True)
+        )
         print(f"  Adapters and classifier loaded successfully.")
-
-        # Cleanup classifier file from disk now that it's in memory (optional)
-        if os.path.exists(classifier_path):
-            os.remove(classifier_path)
 
         # --- Run test ---
         eval_trainer = pl.Trainer(
@@ -275,6 +277,11 @@ def train_single_seed(
         test_metric_value = test_results[0].get(test_metric_name, None)
         print(f"  Test metric ({test_metric_name}): {test_metric_value}")
 
+        # --- Purge Temp Directory (Zero Disk Residue) ---
+        if temp_dir.exists():
+            shutil.rmtree(temp_dir, ignore_errors=True)
+            print(f"  [Purged] Deleted temp adapter files from disk.")
+
         # --- Final RAM & GPU memory cleanup ---
         del eval_model
         del eval_trainer
@@ -285,16 +292,19 @@ def train_single_seed(
             "seed": seed,
             "metric_name": test_metric_name,
             "metric_value": test_metric_value,
-            "adapter_dir": adapter_dir,
         }
 
     else:
+        # Cleanup non-zero ranks
+        if temp_dir.exists():
+            shutil.rmtree(temp_dir, ignore_errors=True)
         seed_result = None
 
     if torch.distributed.is_available() and torch.distributed.is_initialized():
         torch.distributed.barrier()
 
     return seed_result
+
 
 # ---------------------------------------------------------------------------
 # Run all seeds for a dataset
@@ -311,7 +321,11 @@ def run_dataset(config: dict, dataset_name: str, output_root: Path) -> dict:
     all_results = []
     for seed in seeds:
         result = train_single_seed(ds_config, dataset_name, seed, output_root)
-        all_results.append(result)
+        if result is not None:
+            all_results.append(result)
+
+    if not all_results:
+        return {}
 
     metric_name = all_results[0]["metric_name"]
     metric_values = [r["metric_value"] for r in all_results if r["metric_value"] is not None]
@@ -334,6 +348,7 @@ def run_dataset(config: dict, dataset_name: str, output_root: Path) -> dict:
         "mean": float(mean_metric),
         "std": float(std_metric),
     }
+
 
 # ---------------------------------------------------------------------------
 # CLI entry point
@@ -365,18 +380,22 @@ def main():
     all_dataset_results = []
     for name in dataset_names:
         result = run_dataset(config, name, output_root)
-        all_dataset_results.append(result)
+        if result:
+            all_dataset_results.append(result)
 
-        result_file = output_root / name / "results.json"
-        result_file.parent.mkdir(parents=True, exist_ok=True)
-        with open(result_file, "w") as f:
-            json.dump(result, f, indent=2)
+            # Save per-dataset metrics to JSON (~1 KB)
+            result_file = output_root / name / "results.json"
+            result_file.parent.mkdir(parents=True, exist_ok=True)
+            with open(result_file, "w") as f:
+                json.dump(result, f, indent=2)
 
     print(f"\n{'#'*70}")
     print(f"  FINAL SUMMARY")
+    print(f"{'#'*70}")
     for r in all_dataset_results:
         print(f"  {r['dataset']:30s} {r['metric_name']}: {r['mean']:.4f} ± {r['std']:.4f}")
     print(f"{'#'*70}\n")
+
 
 if __name__ == "__main__":
     main()
