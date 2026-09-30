@@ -35,12 +35,11 @@ class AdapterOnlyCheckpoint(Callback):
     Monitors a validation metric and saves ONLY the LoRA adapters and classifier
     head to a temp folder when the metric improves.
     """
-    def __init__(self, monitor: str, mode: str, adapter_dir: Path, classifier_path: Path):
+    def __init__(self, monitor: str, mode: str, adapter_dir: Path):
         super().__init__()
         self.monitor = monitor
         self.mode = mode
         self.adapter_dir = str(adapter_dir.resolve())
-        self.classifier_path = str(classifier_path.resolve())
         
         self.best_score = float("inf") if mode == "min" else float("-inf")
         self.saved_any = False
@@ -64,7 +63,6 @@ class AdapterOnlyCheckpoint(Callback):
                 print(f"\n  [Checkpoint] {self.monitor} improved to {self.best_score:.4f}. Saving adapters...")
                 os.makedirs(self.adapter_dir, exist_ok=True)
                 pl_module.model.save_pretrained(self.adapter_dir)
-                torch.save(pl_module.classifier.state_dict(), self.classifier_path)
                 self.saved_any = True
 
 
@@ -124,9 +122,11 @@ def train_single_seed(
     model_name = ds_config["model_name"]
     base_model = ds_config["base_model"]
     task_type = ds_config["task_type"]
+    description = ds_config.get("description", "Predict the molecular property.")
     metric = ds_config["metric"]
     metric_mode = ds_config["metric_mode"]
     max_epochs = ds_config["max_epochs"]
+    max_length = ds_config.get("max_length", 512)
     patience = ds_config["early_stopping_patience"]
     precision = ds_config.get("precision", "bf16-mixed")
     batch_size = ds_config["batch_size"]
@@ -163,13 +163,13 @@ def train_single_seed(
     print(f"{'='*60}")
 
     train_ds = dataset.MolnetDataset(
-        loader_fn, mode="train", model=model_name
+        loader_fn, mode="train", model=model_name, max_length=max_length, task_type=task_type, description=description
     )
     val_ds = dataset.MolnetDataset(
-        loader_fn, mode="valid", model=model_name, do_random=False
+        loader_fn, mode="valid", model=model_name, do_random=False, max_length=max_length, task_type=task_type, description=description
     )
     test_ds = dataset.MolnetDataset(
-        loader_fn, mode="test", model=model_name, do_random=False
+        loader_fn, mode="test", model=model_name, do_random=False, max_length=max_length, task_type=task_type, description=description
     )
 
     num_tasks = train_ds.num_tasks
@@ -207,8 +207,7 @@ def train_single_seed(
     adapter_checkpoint = AdapterOnlyCheckpoint(
         monitor=metric,
         mode=metric_mode,
-        adapter_dir=temp_adapter_dir,
-        classifier_path=temp_classifier_path
+        adapter_dir=temp_adapter_dir
     )
 
     # --- Trainer ---
@@ -237,7 +236,6 @@ def train_single_seed(
             print(f"  [Fallback] No improvement detected; saving final epoch weights for evaluation...")
             temp_adapter_dir.mkdir(parents=True, exist_ok=True)
             model.model.save_pretrained(str(temp_adapter_dir))
-            torch.save(model.classifier.state_dict(), str(temp_classifier_path))
 
         # --- RAM Cleanup before test evaluation ---
         del model
@@ -257,10 +255,7 @@ def train_single_seed(
         )
 
         eval_model.configure_model(checkpoint_path=str(temp_adapter_dir))
-        eval_model.classifier.load_state_dict(
-            torch.load(str(temp_classifier_path), weights_only=True)
-        )
-        print(f"  Adapters and classifier loaded successfully.")
+        print(f"  Adapters loaded successfully.")
 
         # --- Run test ---
         eval_trainer = pl.Trainer(

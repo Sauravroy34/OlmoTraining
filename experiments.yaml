@@ -5,9 +5,12 @@ defaults:
   seeds: [42, 43, 44]
   early_stopping_patience: 3
   strategy: null       # null for single GPU, "ddp" for multi-GPU
+  description: "Molecule property prediction task."
+  max_length: 512
 
 datasets:
   bbbp:
+    description: "Predict whether the molecule can penetrate the blood-brain barrier."
     task_type: classification
     loader: "load_bbbp"
     metric: "val_roc_auc"
@@ -22,6 +25,7 @@ datasets:
     weight_decay: 1.0e-3
 
   bace_classification:
+    description: "Predict whether the molecule is an inhibitor of human beta-secretase 1 (BACE-1)."
     task_type: classification
     loader: "load_bace_classification"
     metric: "val_roc_auc"

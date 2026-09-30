@@ -13,7 +13,7 @@ from peft import (
 )
 from sklearn.metrics import roc_auc_score, mean_squared_error
 import numpy as np
-
+import re
 class OlmoModelQLora(pl.LightningModule):
     def __init__(self, hparams_config, num_tasks,task_type, model_name,base_model):
         super().__init__()
@@ -44,28 +44,11 @@ class OlmoModelQLora(pl.LightningModule):
             bias="none",
             task_type=TaskType.CAUSAL_LM,
         )
-        if self.task_type == "classification":
-            self.loss_fn = self._masked_bce
-        elif self.task_type == "regression":
-            self.loss_fn = self._masked_mse
-        else:
-            raise ValueError("Task type must be classification or regression")
+        self.loss_fn = nn.CrossEntropyLoss(ignore_index=-100)
         self.validation_step_outputs = []
         self.test_step_outputs = []
 
-    def _masked_bce(self,logits,labels):
-        mask = ~torch.isnan(labels)
-        loss = nn.functional.binary_cross_entropy_with_logits(
-            logits[mask], labels[mask], reduction="mean"
-        )
-        return loss
 
-    def _masked_mse(self, preds, labels):
-        mask = ~torch.isnan(labels)
-        loss = nn.functional.mse_loss(
-            preds[mask], labels[mask], reduction="mean"
-        )
-        return loss
 
     def _load_model(self,checkpoint_path):
 
@@ -117,47 +100,93 @@ class OlmoModelQLora(pl.LightningModule):
 
         self.model.config.pad_token_id = self.tokenizer.pad_token_id
         self.model.gradient_checkpointing_enable()
-            
-        hidden_size = self.model.config.hidden_size    
-        self.classifier = nn.Sequential(
-            nn.Linear(hidden_size, self.num_tasks)
-        )
 
     def forward(self, input_ids, attention_mask):
         outputs = self.model(
             input_ids=input_ids,
             attention_mask=attention_mask,
-            return_dict=True,
-            output_hidden_states=True
+            return_dict=True
         )
-        last_hidden_states = outputs.hidden_states[-1]
-        sequence_lengths = attention_mask.sum(dim=1) - 1
-        batch_size = input_ids.shape[0]
+        return outputs.logits
         
-        final_token_hidden = last_hidden_states[torch.arange(batch_size), sequence_lengths]
-        logits = self.classifier(final_token_hidden)
-        return logits
+    def get_yes_no_probs(self, logits, labels):
+        yes_id = self.tokenizer.encode("Yes", add_special_tokens=False)[0]
+        no_id = self.tokenizer.encode("No", add_special_tokens=False)[0]
         
+        batch_size = labels.size(0)
+        preds = []
+        for i in range(batch_size):
+            non_masked_idx = (labels[i] != -100).nonzero(as_tuple=True)[0]
+            if len(non_masked_idx) > 0:
+                first_ans_idx = non_masked_idx[0].item()
+                pred_idx = first_ans_idx - 1
+                
+                logits_at_pred = logits[i, pred_idx]
+                p_yes = torch.exp(logits_at_pred[yes_id])
+                p_no = torch.exp(logits_at_pred[no_id])
+                prob_yes = p_yes / (p_yes + p_no + 1e-10)
+                preds.append(prob_yes.item())
+            else:
+                preds.append(0.5)
+        return torch.tensor(preds, device=logits.device)
+
+    def generate_and_parse_numbers(self, batch):
+        batch_size = batch["input_ids"].size(0)
+        preds = []
+        
+        # Determine max prompt length in this batch to avoid padding issues in generation
+        # Better: generate per item or pad correctly on the left (but our padding is on the right)
+        # We will do a loop for simplicity and correctness
+        for i in range(batch_size):
+            non_masked_idx = (batch["labels"][i] != -100).nonzero(as_tuple=True)[0]
+            if len(non_masked_idx) > 0:
+                prompt_len = non_masked_idx[0].item()
+                prompt_ids = batch["input_ids"][i, :prompt_len].unsqueeze(0)
+                prompt_mask = batch["attention_mask"][i, :prompt_len].unsqueeze(0)
+            else:
+                prompt_ids = batch["input_ids"][i].unsqueeze(0)
+                prompt_mask = batch["attention_mask"][i].unsqueeze(0)
+                
+            generated_ids = self.model.generate(
+                input_ids=prompt_ids,
+                attention_mask=prompt_mask,
+                max_new_tokens=10,
+                pad_token_id=self.tokenizer.pad_token_id,
+                eos_token_id=self.tokenizer.eos_token_id,
+                do_sample=False
+            )
+            gen_text = self.tokenizer.decode(generated_ids[0, prompt_ids.size(1):], skip_special_tokens=True)
+            match = re.search(r"[-+]?\d*\.\d+|\d+", gen_text)
+            if match:
+                preds.append(float(match.group()))
+            else:
+                preds.append(0.0)
+                
+        return torch.tensor(preds, device=batch["input_ids"].device)
+
     def training_step(self, batch, batch_idx):
         logits = self(batch["input_ids"], batch["attention_mask"])
-        loss = self.loss_fn(logits.squeeze(-1), batch["labels"].float())
+        shift_logits = logits[..., :-1, :].contiguous()
+        shift_labels = batch["labels"][..., 1:].contiguous()
+        loss = self.loss_fn(shift_logits.view(-1, shift_logits.size(-1)), shift_labels.view(-1))
         self.log("train_loss", loss, prog_bar=True, on_step=True, on_epoch=True)
         return loss
     
     def validation_step(self, batch, batch_idx):
         logits = self(batch["input_ids"], batch["attention_mask"])
-        loss = self.loss_fn(logits.squeeze(-1), batch["labels"].float())
+        shift_logits = logits[..., :-1, :].contiguous()
+        shift_labels = batch["labels"][..., 1:].contiguous()
+        loss = self.loss_fn(shift_logits.view(-1, shift_logits.size(-1)), shift_labels.view(-1))
         
         if self.task_type == "classification":
-            preds = torch.sigmoid(logits.squeeze(-1))
+            preds = self.get_yes_no_probs(logits, batch["labels"])
         else:
-            preds = logits.squeeze(-1)
+            preds = self.generate_and_parse_numbers(batch)
         
-        # Store predictions for epoch-end calculation
         self.validation_step_outputs.append({
             "val_loss": loss.detach(),
-            "preds": preds.detach(),
-            "labels": batch["labels"].detach()
+            "preds": preds.detach() if isinstance(preds, torch.Tensor) else torch.tensor(preds, device=loss.device),
+            "labels": batch["raw_labels"].detach()
         })
         self.log("val_loss", loss, prog_bar=True, sync_dist=True)
         return loss
@@ -189,17 +218,19 @@ class OlmoModelQLora(pl.LightningModule):
 
     def test_step(self, batch, batch_idx):
         logits = self(batch["input_ids"], batch["attention_mask"])
-        loss = self.loss_fn(logits.squeeze(-1), batch["labels"].float())
+        shift_logits = logits[..., :-1, :].contiguous()
+        shift_labels = batch["labels"][..., 1:].contiguous()
+        loss = self.loss_fn(shift_logits.view(-1, shift_logits.size(-1)), shift_labels.view(-1))
 
         if self.task_type == "classification":
-            preds = torch.sigmoid(logits.squeeze(-1))
+            preds = self.get_yes_no_probs(logits, batch["labels"])
         else:
-            preds = logits.squeeze(-1)
+            preds = self.generate_and_parse_numbers(batch)
 
         self.test_step_outputs.append({
             "test_loss": loss.detach(),
-            "preds": preds.detach(),
-            "labels": batch["labels"].detach()
+            "preds": preds.detach() if isinstance(preds, torch.Tensor) else torch.tensor(preds, device=loss.device),
+            "labels": batch["raw_labels"].detach()
         })
         self.log("test_loss", loss, prog_bar=True, sync_dist=True)
         return loss
