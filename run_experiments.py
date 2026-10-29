@@ -163,13 +163,13 @@ def train_single_seed(
     print(f"{'='*60}")
 
     train_ds = dataset.MolnetDataset(
-        loader_fn, mode="train", model=model_name
+        loader_fn, mode="train", model=base_model
     )
     val_ds = dataset.MolnetDataset(
-        loader_fn, mode="valid", model=model_name, do_random=False
+        loader_fn, mode="valid", model=base_model, do_random=False
     )
     test_ds = dataset.MolnetDataset(
-        loader_fn, mode="test", model=model_name, do_random=False
+        loader_fn, mode="test", model=base_model, do_random=False
     )
 
     num_tasks = train_ds.num_tasks
